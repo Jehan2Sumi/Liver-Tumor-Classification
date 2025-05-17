@@ -1,0 +1,235 @@
+%%%%%%%%%%%%%%%%% SECTION 2: TRAINING ,EVALUATION OF PERFORMANCE METRICS %%%%%
+
+# Import necessary libraries
+import tensorflow as tf
+import os
+import numpy as np
+import pandas as pd
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import ResNet50, ResNet101, ResNet152, ResNet50V2
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+
+# Dataset paths
+train_metadata_path = '/kaggle/working/LiverDiseaseSplit/train_metadata.csv'
+val_metadata_path = '/kaggle/working/LiverDiseaseSplit/val_metadata.csv'
+test_metadata_path = '/kaggle/working/LiverDiseaseSplit/test_metadata.csv'
+
+# Load metadata
+train_metadata = pd.read_csv(train_metadata_path)
+val_metadata = pd.read_csv(val_metadata_path)
+test_metadata = pd.read_csv(test_metadata_path)
+
+# Check class distribution
+print("Class distribution in training data:")
+print(train_metadata['Class'].value_counts())
+
+# Calculate class weights
+class_weights_array = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_metadata['Class']),
+    y=train_metadata['Class']
+)
+class_weights_dict = dict(enumerate(class_weights_array))
+print("Class Weights:", class_weights_dict)
+
+# Data generators
+def get_data_generators(batch_size):
+    train_datagen = ImageDataGenerator(rescale=1./255)
+    val_test_datagen = ImageDataGenerator(rescale=1./255)
+    
+    train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_metadata,
+        x_col='Image Path',
+        y_col='Class',
+        target_size=(224, 224),
+        batch_size=batch_size,
+        class_mode='binary',
+        shuffle=True
+    )
+    val_generator = val_test_datagen.flow_from_dataframe(
+        dataframe=val_metadata,
+        x_col='Image Path',
+        y_col='Class',
+        target_size=(224, 224),
+        batch_size=batch_size,
+        class_mode='binary',
+        shuffle=False
+    )
+    test_generator = val_test_datagen.flow_from_dataframe(
+        dataframe=test_metadata,
+        x_col='Image Path',
+        y_col='Class',
+        target_size=(224, 224),
+        batch_size=1,
+        class_mode='binary',
+        shuffle=False
+    )
+    return train_generator, val_generator, test_generator
+
+# Build model
+def build_model(base_model, dense_units=256, dropout_rate=0.4):
+    base_model.trainable = False  # Freeze base model layers
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(dense_units, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(dropout_rate)(x)
+    predictions = Dense(1, activation='sigmoid')(x)
+    return Model(inputs=base_model.input, outputs=predictions)
+
+# Training and evaluation with multiple learning rates
+def train_and_evaluate_resnet_with_lr(model_name, learning_rates, batch_size, epochs, dense_units, dropout_rate):
+    train_generator, val_generator, test_generator = get_data_generators(batch_size)
+    results = {}
+
+    for lr in learning_rates:
+        print(f"Training {model_name} with Learning Rate: {lr}")
+        
+        # Select base model
+        if model_name == 'ResNet50':
+            base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        elif model_name == 'ResNet101':
+            base_model = ResNet101(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        elif model_name == 'ResNet152':
+            base_model = ResNet152(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        elif model_name == 'ResNet50V2':
+            base_model = ResNet50V2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        else:
+            raise ValueError("Invalid model name")
+
+        model = build_model(base_model, dense_units, dropout_rate)
+        model.compile(
+            optimizer=Adam(learning_rate=lr),
+            loss='binary_crossentropy',
+            metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+        )
+        
+        # Callbacks
+        callbacks = [
+            ModelCheckpoint(f'/kaggle/working/{model_name}_lr_{lr}_best_model.keras', save_best_only=True, monitor='val_auc', mode='max'),
+            ReduceLROnPlateau(monitor='val_auc', factor=0.5, patience=5, verbose=1),
+            EarlyStopping(monitor='val_auc', patience=10, mode='max', restore_best_weights=True)
+        ]
+        
+        # Train
+        history = model.fit(
+            train_generator,
+            validation_data=val_generator,
+            epochs=epochs,
+            class_weight=class_weights_dict,
+            callbacks=callbacks
+        )
+        
+        # Test evaluation
+        test_generator.reset()
+        predictions = model.predict(test_generator, verbose=1)
+        y_true = test_generator.classes
+        y_pred_proba = predictions.flatten()
+        y_pred = (y_pred_proba > 0.5).astype(int)
+        
+        # Metrics
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred)
+        auc = roc_auc_score(y_true, y_pred_proba)
+        fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+        
+        # Confusion Matrix
+        cm = confusion_matrix(y_true, y_pred)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Benign", "Malignant"])
+        disp.plot(cmap='Blues')
+        plt.title(f"Confusion Matrix: {model_name} (LR: {lr})")
+        plt.show()
+        
+        # Print Metrics
+        print(f"Model: {model_name} | Learning Rate: {lr}")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"AUC: {auc:.4f}")
+        print("-" * 50)
+        
+        results[lr] = {
+            "history": history,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "auc": auc,
+            "fpr": fpr,
+            "tpr": tpr
+        }
+    
+    return results
+
+# Train Models
+learning_rates = [1e-3]
+batch_size = 32
+dense_units = 512
+dropout_rate = 0.4
+epochs = 50
+
+results_all_models = {}
+
+for model_name in ['ResNet50', 'ResNet101', 'ResNet152', 'ResNet50V2']:
+    print(f"Training {model_name} with Multiple Learning Rates")
+    results_all_models[model_name] = train_and_evaluate_resnet_with_lr(
+        model_name, learning_rates, batch_size, epochs, dense_units, dropout_rate
+    )
+
+# Combined Metrics Visualization
+def plot_combined_metrics(results_all_models):
+    # Combined Accuracy and Loss Plot
+    plt.figure(figsize=(12, 6))
+    for model_name, results in results_all_models.items():
+        for lr, metrics in results.items():
+            plt.plot(metrics['history'].history['accuracy'], label=f'{model_name} (LR: {lr}) Train Accuracy')
+            plt.plot(metrics['history'].history['val_accuracy'], label=f'{model_name} (LR: {lr}) Val Accuracy')
+    plt.title('Combined Accuracy Plot')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.show()
+
+    plt.figure(figsize=(12, 6))
+    for model_name, results in results_all_models.items():
+        for lr, metrics in results.items():
+            plt.plot(metrics['history'].history['loss'], label=f'{model_name} (LR: {lr}) Train Loss')
+            plt.plot(metrics['history'].history['val_loss'], label=f'{model_name} (LR: {lr}) Val Loss')
+    plt.title('Combined Loss Plot')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+
+    # Combined ROC Curves
+    plt.figure(figsize=(8, 6))
+    for model_name, results in results_all_models.items():
+        for lr, metrics in results.items():
+            plt.plot(metrics['fpr'], metrics['tpr'], label=f'{model_name} (LR: {lr}) AUC = {metrics["auc"]:.2f}')
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Guess')
+    plt.title('Combined ROC Curves')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.legend()
+    plt.show()
+
+# Plot Metrics
+plot_combined_metrics(results_all_models)
