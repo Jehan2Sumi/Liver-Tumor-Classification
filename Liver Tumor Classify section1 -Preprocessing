@@ -1,0 +1,234 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% LIVER TUMOR CLASSIFICATION %%%%%
+%%% SECTION I : DATA PREPROCESSNG ,DATA SPLITTING TO TAIN,VALIDATION,TEST %%%%%%
+
+import os
+import shutil
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from PIL import Image, ImageEnhance
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# Define paths
+base_dir = '/kaggle/input/liver-classifiy/liver-disease-dataset1/LiverDiseaseClassify'
+output_dir = '/kaggle/working/LiverDiseaseSplit'
+
+# Define categories with number of images per patient folder
+categories = {
+    'Benign_Tumors': {
+        'FNH': {
+            'P-01': 57, 'P-02': 100, 'P-03': 40, 'P-04': 2
+        },
+        'Hemangiomas': {
+            'P-01': 55, 'P-02': 40, 'P-03': 82, 'P-04': 3, 
+            'P-05': 75, 'P-06': 45, 'P-07': 45, 'P-08': 60,
+            'P-09': 66, 'P-10': 30, 'P-11': 4, 'P-12': 3,
+            'P-13': 30, 'P-14': 33
+        },
+        'Hepatocellular Adenomas': {
+            'P-01': 40, 'P-02': 80, 'P-03': 36
+        },
+        'Liver Cysts': {
+            'P-01': 35, 'P-02': 48, 'P-03': 2, 'P-04': 50, 'P-05': 18
+        }
+    },
+    'Malignant_Cancers/Primary': {
+        'Angiosarcoma': {
+            'P-01': 63, 'P-02': 40
+        },
+        'Hepatoblastoma': {
+            'P-01': 17, 'P-02': 55, 'P-03': 200, 
+            'P-04': 13, 'P-05': 3, 'P-06': 45
+        },
+        'ICC': {
+            'P-01': 20, 'P-02': 117, 'P-03': 85, 'P-04': 60
+        },
+        'HCC': {
+            'P-01': 4, 'P-02': 43, 'P-03': 105, 'P-04': 71,
+            'P-05': 48, 'P-06': 63, 'P-07': 68, 'P-08': 50,
+            'P-09': 95, 'P-10': 180, 'P-11': 215, 'P-12': 35,
+            'P-13': 20, 'P-14': 160, 'P-15': 35, 'P-16': 107,
+            'P-17': 39, 'P-18': 36, 'P-19': 95, 'P-20': 12,
+            'P-21': 45
+        }
+    },
+    'Malignant_Cancers/Secondary': {
+        'Liver Metastasis': {
+            'P-01': 166, 'P-02': 31, 'P-03': 21, 'P-04': 25
+        }
+    }
+}
+
+# Create output directories
+os.makedirs(output_dir, exist_ok=True)
+for split in ['train', 'val', 'test']:
+    for category in ['benign', 'malignant']:
+        os.makedirs(os.path.join(output_dir, split, category), exist_ok=True)
+
+# Function to preprocess images
+def preprocess_image(img_path):
+    # Load the image in grayscale (as it's a typical format for CT images)
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+
+    # Step 1: Resize to 512x512
+    img = cv2.resize(img, (512, 512))
+
+    # Step 2: Histogram equalization
+    img = cv2.equalizeHist(img)
+
+    # Step 3: Gaussian blur for noise reduction
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+
+    # Step 4: Contrast enhancement
+    img_pil = Image.fromarray(img)
+    enhancer = ImageEnhance.Contrast(img_pil)
+    img_pil = enhancer.enhance(1.5)
+    img = np.array(img_pil)
+
+    # Step 5: Normalize to [0, 1]
+    img = img / 255.0
+
+    return img
+
+# Function to collect image metadata
+def collect_image_metadata():
+    metadata = []
+    expected_total = 0
+    actual_total = 0
+
+    for tumor_type, subcategories in categories.items():
+        for subcategory, patient_data in subcategories.items():
+            for patient_folder, expected_count in patient_data.items():
+                folder_path = os.path.join(base_dir, tumor_type, subcategory, patient_folder)
+                expected_total += expected_count
+
+                if os.path.exists(folder_path):
+                    for idx in range(1, expected_count + 1):
+                        img_filename = f"{idx}.png"
+                        img_path = os.path.join(folder_path, img_filename)
+
+                        if os.path.exists(img_path):
+                            actual_total += 1
+                            metadata.append({
+                                'Image Path': img_path,
+                                'Class': 'benign' if 'Benign_Tumors' in tumor_type else 'malignant',
+                                'Subcategory': subcategory,
+                                'Patient_ID': patient_folder,
+                                'Original_Path': img_path
+                            })
+                        else:
+                            print(f"Missing image: {img_path}")
+                else:
+                    print(f"Missing folder: {folder_path}")
+
+    print(f"\nExpected total images: {expected_total}")
+    print(f"Actually found images: {actual_total}")
+    return metadata
+
+# Collect metadata
+metadata = collect_image_metadata()
+metadata_df = pd.DataFrame(metadata)
+
+# Split dataset
+train_df, temp_df = train_test_split(metadata_df, test_size=0.3, random_state=42, stratify=metadata_df['Class'])
+val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df['Class'])
+
+# Function to copy files with verification
+def copy_files_with_verification(split_df, split_name, augment=False):
+    successful_copies = 0
+    failed_copies = 0
+
+    # Initialize ImageDataGenerator for augmentation
+    if augment:
+        datagen = ImageDataGenerator(
+            rotation_range=40,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            shear_range=0.2,
+            zoom_range=0.2,
+            horizontal_flip=True,
+            fill_mode='nearest'
+        )
+
+    for _, row in split_df.iterrows():
+        src_path = row['Original_Path']
+        class_label = row['Class']
+        dst_dir = os.path.join(output_dir, split_name, class_label)
+        dst_path = os.path.join(dst_dir, os.path.basename(src_path))
+
+        try:
+            if os.path.exists(src_path):
+                # Apply preprocessing (resizing, noise reduction, contrast enhancement)
+                img = preprocess_image(src_path)
+
+                # If augmenting, apply augmentation
+                if augment:
+                    # Add an extra dimension to the image to make it (1, 512, 512, 1) for grayscale
+                    img = np.expand_dims(img, axis=-1)  # This adds the channel dimension
+                    
+                    # Now apply the augmentation
+                    img = np.expand_dims(img, axis=0)  # Add batch dimension
+                    i = 0
+                    for batch in datagen.flow(img, batch_size=1, save_to_dir=dst_dir, save_prefix='aug', save_format='png'):
+                        i += 1
+                        if i > 10:  # Create 10 augmented images per original
+                            break
+                else:
+                    cv2.imwrite(dst_path, img * 255)  # Save the preprocessed image
+
+                successful_copies += 1
+            else:
+                failed_copies += 1
+                print(f"Source file not found: {src_path}")
+        except Exception as e:
+            failed_copies += 1
+            print(f"Error copying {src_path}: {str(e)}")
+
+    print(f"\n{split_name} split copying results:")
+    print(f"Successful copies: {successful_copies}")
+    print(f"Failed copies: {failed_copies}")
+
+# Copy files to respective splits
+for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    augment = True if split_name == 'train' else False
+    copy_files_with_verification(split_df, split_name, augment=augment)
+
+# Save metadata
+for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    output_path = os.path.join(output_dir, f'{split_name}_metadata.csv')
+    split_df.to_csv(output_path, index=False)
+    print(f"\nSaved {split_name} metadata to {output_path}")
+    print(f"Number of records: {len(split_df)}")
+    print(f"Class distribution: \n{split_df['Class'].value_counts()}")
+
+# Function to display random images with metadata
+def display_random_images_with_metadata(split_name, metadata_path, num_images=5):
+    metadata_df = pd.read_csv(metadata_path)
+    random_samples = metadata_df.sample(n=num_images)
+    print(f"Displaying {num_images} random images from {split_name} split:\n")
+    for _, row in random_samples.iterrows():
+        img_path = row['Original_Path']
+        img_label = row['Class']
+        subcategory = row['Subcategory']
+        patient_id = row['Patient_ID']
+        print(f"Image Path: {img_path}, Label: {img_label}, Subcategory: {subcategory}, Patient ID: {patient_id}")
+        if os.path.exists(img_path):
+            img = Image.open(img_path)
+            plt.imshow(img, cmap='gray')
+            plt.title(f"Class: {img_label}, Subcategory: {subcategory}, Patient ID: {patient_id}")
+            plt.axis('off')
+            plt.show()
+        else:
+            print(f"Warning: Image file not found at path {img_path}")
+
+# Verify and display random images
+print("\n=== Train Metadata Verification and Display ===")
+display_random_images_with_metadata('train', os.path.join(output_dir, 'train_metadata.csv'), num_images=3)
+
+print("\n=== Validation Metadata Verification and Display ===")
+display_random_images_with_metadata('val', os.path.join(output_dir, 'val_metadata.csv'), num_images=3)
+
+print("\n=== Test Metadata Verification and Display ===")
+display_random_images_with_metadata('test', os.path.join(output_dir, 'test_metadata.csv'), num_images=3)
